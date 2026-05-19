@@ -17,6 +17,9 @@
     .hidden { display:none; }
     table { width:100%; border-collapse:collapse; margin-top:10px; }
     th,td { border-bottom:1px solid #ddd; padding:6px; text-align:left; }
+    #video { max-width:100%; border-radius:6px; background:#000; }
+    #preview { display:block; max-width:100%; margin-top:8px; border:1px solid #ddd; }
+    #status { margin-top:8px; color:#333; }
   </style>
 </head>
 <body>
@@ -25,23 +28,29 @@
   </header>
 
   <div class="wrap">
-    <!-- Scanner -->
     <section class="card">
       <h2>Scan QR</h2>
+
+      <!-- Video and preview canvas -->
       <video id="video" playsinline autoplay muted class="hidden"></video>
       <canvas id="preview" class="hidden"></canvas>
+
+      <!-- Controls -->
       <div>
         <button id="openNative" class="ghost">Open Native Camera</button>
         <button id="openInApp">Open In-App Camera</button>
         <button id="closeInApp" class="ghost hidden">Close Camera</button>
         <button id="capture">Capture</button>
         <button id="upload" class="ghost">Upload Photo</button>
-        <input id="file" type="file" accept="image/*" class="hidden">
       </div>
+
+      <!-- Hidden file inputs -->
+      <input id="cameraInput" type="file" accept="image/*" capture="environment" class="hidden">
+      <input id="file" type="file" accept="image/*" class="hidden">
+
       <div id="status">Ready — align QR inside the guide.</div>
     </section>
 
-    <!-- Logs -->
     <section class="card">
       <h2>Stored Logs <span id="count">0</span></h2>
       <table id="logTable">
@@ -49,31 +58,17 @@
         <tbody></tbody>
       </table>
       <div>
-        <input id="exportDate" type="date">
-        <button id="downloadDate" class="ghost">Download Date</button>
-      </div>
-      <div>
-        <input id="exportFrom" type="date">
-        <input id="exportTo" type="date">
-        <button id="downloadRange" class="ghost">Download Range</button>
-      </div>
-      <div>
         <button id="clearAll" class="danger">Clear All Logs</button>
-        <button id="chooseFolder" class="ghost">Choose Save Folder</button>
-        <button id="saveAll" class="ghost">Save All</button>
       </div>
     </section>
   </div>
 
-  <!-- Hidden inputs for native camera and upload -->
-  <input id="cameraInput" type="file" accept="image/*" capture="environment" class="hidden">
-
-  <!-- Decoder libraries -->
+  <!-- Local decoder libraries (must exist in libs/) -->
   <script src="libs/jsqr.min.js"></script>
   <script src="libs/zxing.min.js"></script>
 
   <script>
-  // Register service worker
+  // --- Service worker registration (sw.js must be in repo root) ---
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').then(r=>{
       console.log('SW registered', r.scope);
@@ -82,6 +77,7 @@
     });
   }
 
+  // Elements
   const video = document.getElementById('video');
   const preview = document.getElementById('preview');
   const status = document.getElementById('status');
@@ -92,121 +88,186 @@
   const cameraInput = document.getElementById('cameraInput');
   const uploadBtn = document.getElementById('upload');
   const fileInput = document.getElementById('file');
-  let stream = null;
 
-  // Robust decode function
-  async function decodeFileRobust(fileOrBlob){
-    const img = await new Promise((res, rej)=>{
-      const i=new Image();
-      i.onload=()=>res(i);
-      i.onerror=()=>rej(new Error('image load'));
-      i.src = URL.createObjectURL(fileOrBlob);
+  // Utility: wait until video metadata is ready
+  function waitForVideoReady(v, timeout = 2000) {
+    return new Promise(resolve => {
+      if (v.readyState >= 2 && v.videoWidth && v.videoHeight) return resolve();
+      const onMeta = () => { v.removeEventListener('loadedmetadata', onMeta); resolve(); };
+      v.addEventListener('loadedmetadata', onMeta);
+      setTimeout(() => { v.removeEventListener('loadedmetadata', onMeta); resolve(); }, timeout);
     });
-    const canvas = document.createElement('canvas');
-    canvas.width = img.naturalWidth;
-    canvas.height = img.naturalHeight;
-    canvas.getContext('2d').drawImage(img,0,0);
-    URL.revokeObjectURL(img.src);
-
-    const ctx = canvas.getContext('2d');
-    const data = ctx.getImageData(0,0,canvas.width,canvas.height);
-    const code = window.jsQR ? jsQR(data.data, data.width, data.height) : null;
-    if(code) return code.data;
-
-    if(window.ZXing && window.ZXing.BrowserQRCodeReader){
-      const reader = new window.ZXing.BrowserQRCodeReader();
-      const blob = await new Promise(res => canvas.toBlob(res, 'image/png'));
-      const url = URL.createObjectURL(blob);
-      try {
-        const result = await reader.decodeFromImageUrl(url);
-        URL.revokeObjectURL(url);
-        if(result && result.text) return result.text;
-      } catch(e) {
-        URL.revokeObjectURL(url);
-      }
-    }
-    throw new Error('No QR found');
   }
 
-  function handleDecoded(text){
-    if(text){
-      status.textContent = 'Decoded: ' + text;
-      console.log('Decoded QR:', text);
-      // TODO: add to logs table
+  // Robust decode function: tries jsQR then ZXing
+  async function decodeCanvasOrBlob(source) {
+    let canvas;
+    if (source instanceof HTMLCanvasElement) {
+      canvas = source;
+    } else {
+      // source is Blob/File or Image
+      const img = await new Promise((res, rej) => {
+        const i = new Image();
+        i.onload = () => res(i);
+        i.onerror = () => rej(new Error('image load error'));
+        i.src = URL.createObjectURL(source);
+      });
+      canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth || img.width;
+      canvas.height = img.naturalHeight || img.height;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+      URL.revokeObjectURL(img.src);
     }
-  }
 
-  // In-app camera
-  openInApp.addEventListener('click', async ()=>{
+    // Try jsQR
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'environment' } });
-      video.srcObject = stream;
+      if (window.jsQR) {
+        const ctx = canvas.getContext('2d');
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const res = jsQR(imgData.data, imgData.width, imgData.height);
+        if (res && res.data) return { engine: 'jsQR', text: res.data };
+      }
+    } catch (e) {
+      console.warn('jsQR error', e);
+    }
+
+    // Try ZXing (if available)
+    try {
+      const ReaderClass = (window.ZXing && window.ZXing.BrowserQRCodeReader) || window.BrowserQRCodeReader || window.BrowserMultiFormatReader;
+      if (ReaderClass) {
+        const reader = new ReaderClass();
+        const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+        const url = URL.createObjectURL(blob);
+        try {
+          const result = await reader.decodeFromImageUrl(url);
+          URL.revokeObjectURL(url);
+          if (result && result.text) return { engine: 'ZXing', text: result.text };
+        } catch (e) {
+          URL.revokeObjectURL(url);
+          console.warn('ZXing decode failed', e);
+        }
+      }
+    } catch (e) {
+      console.warn('ZXing init error', e);
+    }
+
+    return null;
+  }
+
+  // Handle decoded text (simple placeholder)
+  function handleDecoded(text) {
+    if (!text) return;
+    status.textContent = 'Decoded: ' + text;
+    console.log('Decoded QR:', text);
+    // TODO: add to logs table or other app logic
+  }
+
+  // Capture handler: ensure correct resolution and scale by devicePixelRatio
+  captureBtn.addEventListener('click', async () => {
+    if (!video || !video.srcObject) {
+      status.textContent = 'Camera not open';
+      return;
+    }
+
+    await waitForVideoReady(video);
+
+    const vw = video.videoWidth || 1280;
+    const vh = video.videoHeight || 720;
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+
+    // Set canvas pixel size for decoding
+    preview.width = Math.round(vw * dpr);
+    preview.height = Math.round(vh * dpr);
+    preview.style.width = vw + 'px';
+    preview.style.height = vh + 'px';
+
+    const ctx = preview.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, preview.width, preview.height);
+    ctx.drawImage(video, 0, 0, vw, vh);
+
+    preview.classList.remove('hidden');
+    status.textContent = 'Captured — creating blob...';
+
+    const blob = await new Promise(r => preview.toBlob(r, 'image/jpeg', 0.95));
+    console.log('capture blob size bytes:', blob && blob.size, 'canvas px:', preview.width, preview.height);
+
+    status.textContent = 'Decoding...';
+    try {
+      const result = await decodeCanvasOrBlob(blob);
+      if (result) {
+        handleDecoded(result.text);
+        status.textContent = 'Decoded (' + result.engine + '): ' + result.text;
+      } else {
+        status.textContent = 'No QR found';
+      }
+    } catch (err) {
+      status.textContent = 'Decode error';
+      console.error('Decode exception', err);
+    }
+  });
+
+  // In-app camera open/close
+  openInApp.addEventListener('click', async () => {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      video.srcObject = s;
+      await waitForVideoReady(video);
       video.classList.remove('hidden');
       closeInApp.classList.remove('hidden');
       openInApp.classList.add('hidden');
-      status.textContent = 'Camera open — tap Capture';
-    } catch(e) {
+      status.textContent = 'Camera open';
+    } catch (e) {
+      console.error('getUserMedia error', e);
       status.textContent = 'Camera unavailable';
     }
   });
 
-  closeInApp.addEventListener('click', ()=>{
-    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
-    video.srcObject=null;
+  closeInApp.addEventListener('click', () => {
+    if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+    video.srcObject = null;
     video.classList.add('hidden');
     closeInApp.classList.add('hidden');
     openInApp.classList.remove('hidden');
     status.textContent = 'Camera closed';
     const ctx = preview.getContext('2d');
-    ctx && ctx.clearRect(0,0,preview.width,preview.height);
+    ctx && ctx.clearRect(0, 0, preview.width, preview.height);
     preview.classList.add('hidden');
   });
 
-  captureBtn.addEventListener('click', async ()=>{
-    if(stream && video.videoWidth){
-      preview.width = video.videoWidth;
-      preview.height = video.videoHeight;
-      const ctx = preview.getContext('2d');
-      ctx.drawImage(video,0,0,preview.width,preview.height);
-      preview.classList.remove('hidden');
-      status.textContent = 'Captured frame — decoding...';
-      try {
-        const blob = await new Promise(res => preview.toBlob(res, 'image/jpeg', 0.95));
-        const decoded = await decodeFileRobust(blob);
-        handleDecoded(decoded);
-      } catch(e) {
-        status.textContent = 'No QR found';
-      }
-    }
-  });
-
-  // Native camera (mobile)
-  openNative.addEventListener('click', ()=> cameraInput.click());
-  cameraInput.addEventListener('change', async ev=>{
-    const f = ev.target.files[0];
-    if(!f) return;
+  // Native camera (mobile) and upload handlers
+  openNative.addEventListener('click', () => cameraInput.click());
+  cameraInput.addEventListener('change', async ev => {
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) return;
     status.textContent = 'Decoding native photo...';
     try {
-      const decoded = await decodeFileRobust(f);
-      handleDecoded(decoded);
-    } catch(e) {
-      status.textContent = 'No QR found';
+      const res = await decodeCanvasOrBlob(f);
+      if (res) handleDecoded(res.text);
+      status.textContent = res ? 'Decoded: ' + res.text : 'No QR found';
+    } catch (e) {
+      status.textContent = 'Decode error';
+      console.error(e);
     }
   });
 
-  // Upload photo (desktop)
-  uploadBtn.addEventListener('click', ()=> fileInput.click());
-  fileInput.addEventListener('change', async ev=>{
-    const f = ev.target.files[0];
-    if(!f) return;
+  uploadBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', async ev => {
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) return;
     status.textContent = 'Decoding uploaded photo...';
     try {
-      const decoded = await decodeFileRobust(f);
-      handleDecoded(decoded);
-    } catch(e) {
-      status.textContent = 'No QR found';
+      const res = await decodeCanvasOrBlob(f);
+      if (res) handleDecoded(res.text);
+      status.textContent = res ? 'Decoded: ' + res.text : 'No QR found';
+    } catch (e) {
+      status.textContent = 'Decode error';
+      console.error(e);
     }
   });
+
+  // Quick library presence log
+  console.log('Decoder libs:', { jsQR: !!window.jsQR, ZXing: !!window.ZXing });
   </script>
 </body>
 </html>
