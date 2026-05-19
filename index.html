@@ -17,9 +17,10 @@
     .hidden { display:none; }
     table { width:100%; border-collapse:collapse; margin-top:10px; }
     th,td { border-bottom:1px solid #ddd; padding:6px; text-align:left; }
-    #video { max-width:100%; border-radius:6px; background:#000; }
+    #video { width:100%; max-width:640px; border-radius:6px; background:#000; }
     #preview { display:block; max-width:100%; margin-top:8px; border:1px solid #ddd; }
     #status { margin-top:8px; color:#333; }
+    .small { font-size:0.9rem; color:#666; }
   </style>
 </head>
 <body>
@@ -31,7 +32,7 @@
     <section class="card">
       <h2>Scan QR</h2>
 
-      <!-- Video and preview canvas -->
+      <!-- Video and preview -->
       <video id="video" playsinline autoplay muted class="hidden"></video>
       <canvas id="preview" class="hidden"></canvas>
 
@@ -49,12 +50,13 @@
       <input id="file" type="file" accept="image/*" class="hidden">
 
       <div id="status">Ready — align QR inside the guide.</div>
+      <div id="debug" class="small"></div>
     </section>
 
     <section class="card">
       <h2>Stored Logs <span id="count">0</span></h2>
       <table id="logTable">
-        <thead><tr><th>Time</th><th>Material</th><th>Truck</th><th></th></tr></thead>
+        <thead><tr><th>Time</th><th>Decoded</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
       <div>
@@ -63,12 +65,12 @@
     </section>
   </div>
 
-  <!-- Local decoder libraries (must exist in libs/) -->
+  <!-- Local decoder libraries -->
   <script src="libs/jsqr.min.js"></script>
   <script src="libs/zxing.min.js"></script>
 
   <script>
-  // --- Service worker registration (sw.js must be in repo root) ---
+  // --- Service worker registration (unchanged) ---
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').then(r=>{
       console.log('SW registered', r.scope);
@@ -81,6 +83,7 @@
   const video = document.getElementById('video');
   const preview = document.getElementById('preview');
   const status = document.getElementById('status');
+  const debug = document.getElementById('debug');
   const openInApp = document.getElementById('openInApp');
   const closeInApp = document.getElementById('closeInApp');
   const captureBtn = document.getElementById('capture');
@@ -88,9 +91,73 @@
   const cameraInput = document.getElementById('cameraInput');
   const uploadBtn = document.getElementById('upload');
   const fileInput = document.getElementById('file');
+  const logTableBody = document.querySelector('#logTable tbody');
+  const countSpan = document.getElementById('count');
+  const clearAllBtn = document.getElementById('clearAll');
+
+  // Simple logger for UI
+  function setStatus(text){
+    status.textContent = text;
+  }
+  function setDebug(text){
+    debug.textContent = text;
+    console.log(text);
+  }
+
+  // LocalStorage logs
+  const LOG_KEY = 'delivery_scanner_logs_v1';
+  function loadLogs(){
+    try {
+      const raw = localStorage.getItem(LOG_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch(e){
+      return [];
+    }
+  }
+  function saveLogs(arr){
+    localStorage.setItem(LOG_KEY, JSON.stringify(arr));
+  }
+  function addLog(text){
+    const logs = loadLogs();
+    const entry = { t: new Date().toISOString(), text: text };
+    logs.unshift(entry);
+    saveLogs(logs);
+    renderLogs();
+  }
+  function clearLogs(){
+    localStorage.removeItem(LOG_KEY);
+    renderLogs();
+  }
+  function renderLogs(){
+    const logs = loadLogs();
+    logTableBody.innerHTML = '';
+    logs.forEach(l=>{
+      const tr = document.createElement('tr');
+      const tdTime = document.createElement('td');
+      tdTime.textContent = new Date(l.t).toLocaleString();
+      const tdText = document.createElement('td');
+      tdText.textContent = l.text;
+      const tdAction = document.createElement('td');
+      const btn = document.createElement('button');
+      btn.textContent = 'Delete';
+      btn.className = 'ghost';
+      btn.onclick = ()=> {
+        const filtered = loadLogs().filter(x => x.t !== l.t);
+        saveLogs(filtered);
+        renderLogs();
+      };
+      tdAction.appendChild(btn);
+      tr.appendChild(tdTime);
+      tr.appendChild(tdText);
+      tr.appendChild(tdAction);
+      logTableBody.appendChild(tr);
+    });
+    countSpan.textContent = logs.length;
+  }
+  clearAllBtn.addEventListener('click', ()=> { clearLogs(); setStatus('Logs cleared'); });
 
   // Utility: wait until video metadata is ready
-  function waitForVideoReady(v, timeout = 2000) {
+  function waitForVideoReady(v, timeout = 2500) {
     return new Promise(resolve => {
       if (v.readyState >= 2 && v.videoWidth && v.videoHeight) return resolve();
       const onMeta = () => { v.removeEventListener('loadedmetadata', onMeta); resolve(); };
@@ -99,24 +166,44 @@
     });
   }
 
-  // Robust decode function: tries jsQR then ZXing
-  async function decodeCanvasOrBlob(source) {
+  // Robust image loader: returns canvas with image drawn
+  async function imageToCanvasFromBlob(blob){
+    // Try createImageBitmap first (fast)
+    try {
+      const bitmap = await createImageBitmap(blob);
+      const c = document.createElement('canvas');
+      c.width = bitmap.width;
+      c.height = bitmap.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(bitmap, 0, 0);
+      bitmap.close && bitmap.close();
+      return c;
+    } catch(e){
+      // fallback to Image element
+      return new Promise((res, rej) => {
+        const img = new Image();
+        img.onload = () => {
+          const c = document.createElement('canvas');
+          c.width = img.naturalWidth || img.width;
+          c.height = img.naturalHeight || img.height;
+          c.getContext('2d').drawImage(img, 0, 0);
+          URL.revokeObjectURL(img.src);
+          res(c);
+        };
+        img.onerror = (err) => rej(err);
+        img.src = URL.createObjectURL(blob);
+      });
+    }
+  }
+
+  // Robust decode: jsQR then ZXing
+  async function decodeCanvasOrBlob(source){
     let canvas;
     if (source instanceof HTMLCanvasElement) {
       canvas = source;
     } else {
-      // source is Blob/File or Image
-      const img = await new Promise((res, rej) => {
-        const i = new Image();
-        i.onload = () => res(i);
-        i.onerror = () => rej(new Error('image load error'));
-        i.src = URL.createObjectURL(source);
-      });
-      canvas = document.createElement('canvas');
-      canvas.width = img.naturalWidth || img.width;
-      canvas.height = img.naturalHeight || img.height;
-      canvas.getContext('2d').drawImage(img, 0, 0);
-      URL.revokeObjectURL(img.src);
+      // source is Blob/File
+      canvas = await imageToCanvasFromBlob(source);
     }
 
     // Try jsQR
@@ -131,7 +218,7 @@
       console.warn('jsQR error', e);
     }
 
-    // Try ZXing (if available)
+    // Try ZXing
     try {
       const ReaderClass = (window.ZXing && window.ZXing.BrowserQRCodeReader) || window.BrowserQRCodeReader || window.BrowserMultiFormatReader;
       if (ReaderClass) {
@@ -154,18 +241,18 @@
     return null;
   }
 
-  // Handle decoded text (simple placeholder)
-  function handleDecoded(text) {
-    if (!text) return;
-    status.textContent = 'Decoded: ' + text;
+  // Handle decoded text
+  function handleDecoded(text){
+    if(!text) return;
+    setStatus('Decoded: ' + text);
+    addLog(text);
     console.log('Decoded QR:', text);
-    // TODO: add to logs table or other app logic
   }
 
   // Capture handler: ensure correct resolution and scale by devicePixelRatio
   captureBtn.addEventListener('click', async () => {
     if (!video || !video.srcObject) {
-      status.textContent = 'Camera not open';
+      setStatus('Camera not open');
       return;
     }
 
@@ -187,39 +274,49 @@
     ctx.drawImage(video, 0, 0, vw, vh);
 
     preview.classList.remove('hidden');
-    status.textContent = 'Captured — creating blob...';
+    setStatus('Captured — creating blob...');
 
     const blob = await new Promise(r => preview.toBlob(r, 'image/jpeg', 0.95));
-    console.log('capture blob size bytes:', blob && blob.size, 'canvas px:', preview.width, preview.height);
+    setDebug('capture blob size bytes: ' + (blob && blob.size) + ' canvas px: ' + preview.width + 'x' + preview.height);
 
-    status.textContent = 'Decoding...';
+    setStatus('Decoding...');
     try {
       const result = await decodeCanvasOrBlob(blob);
       if (result) {
         handleDecoded(result.text);
-        status.textContent = 'Decoded (' + result.engine + '): ' + result.text;
+        setStatus('Decoded (' + result.engine + '): ' + result.text);
       } else {
-        status.textContent = 'No QR found';
+        setStatus('No QR found');
       }
     } catch (err) {
-      status.textContent = 'Decode error';
+      setStatus('Decode error');
       console.error('Decode exception', err);
     }
   });
 
-  // In-app camera open/close
+  // In-app camera open/close with higher resolution constraints
   openInApp.addEventListener('click', async () => {
     try {
-      const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      // Request higher resolution on mobile where possible
+      const constraints = {
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      };
+      const s = await navigator.mediaDevices.getUserMedia(constraints);
       video.srcObject = s;
       await waitForVideoReady(video);
       video.classList.remove('hidden');
       closeInApp.classList.remove('hidden');
       openInApp.classList.add('hidden');
-      status.textContent = 'Camera open';
+      setStatus('Camera open');
+      setDebug('video dims: ' + video.videoWidth + 'x' + video.videoHeight);
     } catch (e) {
       console.error('getUserMedia error', e);
-      status.textContent = 'Camera unavailable';
+      setStatus('Camera unavailable');
     }
   });
 
@@ -229,7 +326,7 @@
     video.classList.add('hidden');
     closeInApp.classList.add('hidden');
     openInApp.classList.remove('hidden');
-    status.textContent = 'Camera closed';
+    setStatus('Camera closed');
     const ctx = preview.getContext('2d');
     ctx && ctx.clearRect(0, 0, preview.width, preview.height);
     preview.classList.add('hidden');
@@ -240,13 +337,14 @@
   cameraInput.addEventListener('change', async ev => {
     const f = ev.target.files && ev.target.files[0];
     if (!f) return;
-    status.textContent = 'Decoding native photo...';
+    setStatus('Decoding native photo...');
+    setDebug('native file size: ' + (f.size || 'unknown'));
     try {
       const res = await decodeCanvasOrBlob(f);
       if (res) handleDecoded(res.text);
-      status.textContent = res ? 'Decoded: ' + res.text : 'No QR found';
+      setStatus(res ? 'Decoded: ' + res.text : 'No QR found');
     } catch (e) {
-      status.textContent = 'Decode error';
+      setStatus('Decode error');
       console.error(e);
     }
   });
@@ -255,19 +353,22 @@
   fileInput.addEventListener('change', async ev => {
     const f = ev.target.files && ev.target.files[0];
     if (!f) return;
-    status.textContent = 'Decoding uploaded photo...';
+    setStatus('Decoding uploaded photo...');
+    setDebug('upload file size: ' + (f.size || 'unknown'));
     try {
       const res = await decodeCanvasOrBlob(f);
       if (res) handleDecoded(res.text);
-      status.textContent = res ? 'Decoded: ' + res.text : 'No QR found';
+      setStatus(res ? 'Decoded: ' + res.text : 'No QR found');
     } catch (e) {
-      status.textContent = 'Decode error';
+      setStatus('Decode error');
       console.error(e);
     }
   });
 
-  // Quick library presence log
+  // Initial render of logs and library presence
+  renderLogs();
   console.log('Decoder libs:', { jsQR: !!window.jsQR, ZXing: !!window.ZXing });
+  setDebug('Decoder libs: jsQR=' + (!!window.jsQR) + ' ZXing=' + (!!window.ZXing));
   </script>
 </body>
 </html>
