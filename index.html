@@ -140,9 +140,55 @@
   <script>
   (function(){
     // -------------------------
+    // IndexedDB helper
+    // -------------------------
+    const DB_NAME = 'delivery-scanner-db';
+    const DB_STORE = 'logs';
+    function openDb(){
+      return new Promise((res, rej) => {
+        const r = indexedDB.open(DB_NAME, 1);
+        r.onupgradeneeded = e => {
+          const db = e.target.result;
+          if(!db.objectStoreNames.contains(DB_STORE)){
+            db.createObjectStore(DB_STORE, { keyPath: 'id' });
+          }
+        };
+        r.onsuccess = e => res(e.target.result);
+        r.onerror = e => rej(e.target.error);
+      });
+    }
+    async function idbPut(entry){
+      const db = await openDb();
+      return new Promise((res, rej) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        tx.objectStore(DB_STORE).put(entry);
+        tx.oncomplete = ()=> res();
+        tx.onerror = e => rej(e.target.error);
+      });
+    }
+    async function idbGetAll(){
+      const db = await openDb();
+      return new Promise((res, rej) => {
+        const tx = db.transaction(DB_STORE, 'readonly');
+        const req = tx.objectStore(DB_STORE).getAll();
+        req.onsuccess = ()=> res(req.result || []);
+        req.onerror = e => rej(e.target.error);
+      });
+    }
+    async function idbDelete(id){
+      const db = await openDb();
+      return new Promise((res, rej) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        tx.objectStore(DB_STORE).delete(id);
+        tx.oncomplete = ()=> res();
+        tx.onerror = e => rej(e.target.error);
+      });
+    }
+
+    // -------------------------
     // Config & elements
     // -------------------------
-    const LOG_KEY = 'delivery_scanner_logs_v1';
+    const LOG_KEY = 'delivery_scanner_logs_v1'; // kept for migration if needed
     const MAX_PIXELS = 2500000; // cap canvas pixel area (2.5MP)
     const video = document.getElementById('video');
     const preview = document.getElementById('preview');
@@ -187,29 +233,12 @@
     function setDebug(txt){ if(showDebug) debug.textContent = txt; console.log(txt); }
 
     // -------------------------
-    // Storage & logs (with quota handling)
+    // Logs using IndexedDB
     // -------------------------
-    function loadLogs(){ try { const raw = localStorage.getItem(LOG_KEY); return raw ? JSON.parse(raw) : []; } catch(e){ console.error('loadLogs error', e); return []; } }
-    function saveLogs(arr){
-      try {
-        localStorage.setItem(LOG_KEY, JSON.stringify(arr));
-      } catch(e) {
-        console.error('saveLogs failed', e);
-        alert('Saving logs failed: storage full or blocked.');
-      }
-    }
-    function uid(){ return Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
-
-    function addLogEntry(entry){
-      const logs = loadLogs();
-      logs.unshift(entry);
-      saveLogs(logs);
-      renderLogs();
-    }
-
-    function renderLogs(){
-      const logs = loadLogs();
+    async function renderLogs(){
+      const logs = await idbGetAll();
       logTableBody.innerHTML = '';
+      logs.sort((a,b)=> (b.t > a.t ? 1 : -1));
       logs.forEach(l=>{
         const tr = document.createElement('tr');
         const tdTime = document.createElement('td'); tdTime.textContent = new Date(l.t).toLocaleString();
@@ -220,23 +249,20 @@
         const tdPhone = document.createElement('td'); tdPhone.textContent = l.driver_phone || '';
         const tdAction = document.createElement('td');
         const del = document.createElement('button'); del.textContent = 'Delete'; del.className='ghost';
-        del.onclick = ()=> { const filtered = loadLogs().filter(x => x.id !== l.id); saveLogs(filtered); renderLogs(); };
+        del.onclick = async ()=> { await idbDelete(l.id); await renderLogs(); };
         tdAction.appendChild(del);
         tr.appendChild(tdTime); tr.appendChild(tdMat); tr.appendChild(tdTruck); tr.appendChild(tdTon); tr.appendChild(tdDriver); tr.appendChild(tdPhone); tr.appendChild(tdAction);
         logTableBody.appendChild(tr);
       });
-      countSpan.textContent = logs.length;
+      const all = await idbGetAll();
+      countSpan.textContent = all.length;
     }
-
-    clearAllBtn.addEventListener('click', ()=>{ localStorage.removeItem(LOG_KEY); renderLogs(); setStatus('Logs cleared'); });
 
     // -------------------------
     // Parse decoded payload (JSON-aware, driver fields)
     // -------------------------
     function parseDecoded(text){
       const s = (text||'').trim();
-
-      // Try JSON first (strict)
       try {
         const obj = JSON.parse(s);
         const material = obj.materialType || obj.material || obj.material_name || obj.materials || '';
@@ -248,9 +274,8 @@
         const raw = s;
         return { time, material, truck, tonnage, raw, driverName, driverPhone, original: obj };
       } catch(e){
-        // Not JSON — fall back to heuristics
+        // fallback heuristics
       }
-
       const parts = s.split(/[\n\r|;]+/).map(p=>p.trim()).filter(Boolean);
       if(parts.length === 1 && s.includes(',')){
         parts.splice(0,1, ...s.split(',').map(p=>p.trim()).filter(Boolean));
@@ -322,7 +347,6 @@
       if(source instanceof HTMLCanvasElement) canvas = source;
       else canvas = await imageToCanvasFromBlob(source);
 
-      // Try jsQR first (fast)
       try {
         if(window.jsQR){
           const ctx = canvas.getContext('2d');
@@ -332,7 +356,6 @@
         }
       } catch(e){ console.warn('jsQR error', e); }
 
-      // Try ZXing on a cropped center region to improve success and speed
       try {
         const ReaderClass = (window.ZXing && window.ZXing.BrowserQRCodeReader) || window.BrowserQRCodeReader || window.BrowserMultiFormatReader;
         if(ReaderClass){
@@ -357,9 +380,8 @@
     // -------------------------
     // Handle decoded text and store structured entry
     // -------------------------
-    function handleDecodedText(decodedText, engineName){
+    async function handleDecodedText(decodedText, engineName){
       const parsed = parseDecoded(decodedText);
-      // Normalize time to ISO
       let isoTime;
       try { isoTime = new Date(parsed.time).toISOString(); } catch(e) { isoTime = new Date().toISOString(); }
       const entry = {
@@ -373,7 +395,8 @@
         driver_phone: parsed.driverPhone || '',
         engine: engineName || ''
       };
-      addLogEntry(entry);
+      await idbPut(entry);
+      await renderLogs();
       setStatus('Decoded (' + (engineName||'') + '): ' + (parsed.material || parsed.raw));
     }
 
@@ -381,7 +404,6 @@
     // Camera helpers & capture (square center-crop)
     // -------------------------
     function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-
     async function waitForVideoReady(v, timeout=3000){
       const start = Date.now();
       while ((v.readyState < 2 || !v.videoWidth || !v.videoHeight) && (Date.now() - start) < timeout) {
@@ -394,44 +416,32 @@
       if(!video || !video.srcObject){ setStatus('Camera not open'); return; }
       await waitForVideoReady(video);
 
-      // Determine square side (use the smaller of video width/height)
       const vw = video.videoWidth || 1280;
       const vh = video.videoHeight || 720;
       const side = Math.min(vw, vh);
-
-      // Source crop coordinates (center crop)
       const sx = Math.round((vw - side) / 2);
       const sy = Math.round((vh - side) / 2);
       const sWidth = side;
       const sHeight = side;
-
-      // Cap output pixels to avoid huge canvases
       const dpr = Math.max(1, window.devicePixelRatio || 1);
       let targetSide = Math.round(side * dpr);
       if (targetSide * targetSide > MAX_PIXELS) {
         targetSide = Math.round(Math.sqrt(MAX_PIXELS));
       }
-
-      // Set preview canvas to square pixel size
       preview.width = targetSide;
       preview.height = targetSide;
-
-      // Draw center-cropped square from video into canvas
       const ctx = preview.getContext('2d');
       ctx.setTransform(1,0,0,1,0,0);
       ctx.clearRect(0,0,preview.width,preview.height);
-      // drawImage(video, sx, sy, sWidth, sHeight, dx, dy, dWidth, dHeight)
       ctx.drawImage(video, sx, sy, sWidth, sHeight, 0, 0, preview.width, preview.height);
-
       preview.classList.remove('hidden');
       setStatus('Captured — creating blob...');
-
       const blob = await new Promise(r=> preview.toBlob(r,'image/jpeg',0.95));
       setDebug('capture blob size bytes: ' + (blob && blob.size) + ' canvas px: ' + preview.width + 'x' + preview.height);
       setStatus('Decoding...');
       try {
         const result = await decodeCanvasOrBlob(blob);
-        if(result) handleDecodedText(result.text, result.engine);
+        if(result) await handleDecodedText(result.text, result.engine);
         else setStatus('No QR found');
       } catch(err){
         setStatus('Decode error');
@@ -446,7 +456,6 @@
         const s = await navigator.mediaDevices.getUserMedia(constraints);
         video.srcObject = s;
         await waitForVideoReady(video);
-        // show video (CSS centers and crops it inside the square)
         video.classList.remove('hidden');
         cameraSquare.classList.remove('hidden');
         closeInApp.classList.remove('hidden');
@@ -482,7 +491,7 @@
       setStatus('Decoding native photo...'); setDebug('native file size: ' + (f.size||'unknown'));
       try {
         const res = await decodeCanvasOrBlob(f);
-        if(res) handleDecodedText(res.text, res.engine);
+        if(res) await handleDecodedText(res.text, res.engine);
         else setStatus('No QR found');
       } catch(e){ setStatus('Decode error'); console.error(e); }
       cameraInput.value = '';
@@ -498,7 +507,7 @@
       setStatus('Decoding uploaded photo...'); setDebug('upload file size: ' + (f.size||'unknown'));
       try {
         const res = await decodeCanvasOrBlob(f);
-        if(res) handleDecodedText(res.text, res.engine);
+        if(res) await handleDecodedText(res.text, res.engine);
         else setStatus('No QR found');
       } catch(e){ setStatus('Decode error'); console.error(e); }
       fileInput.value = '';
@@ -525,22 +534,22 @@
       a.remove(); URL.revokeObjectURL(url);
     }
 
-    downloadDateBtn.addEventListener('click', ()=>{
+    downloadDateBtn.addEventListener('click', async ()=>{
       const date = exportDateInput.value;
       if(!date){ setStatus('Choose a date'); return; }
-      const logs = loadLogs().filter(l => l.t.slice(0,10) === date);
+      const logs = (await idbGetAll()).filter(l => l.t.slice(0,10) === date);
       if(!logs.length){ setStatus('No logs for that date'); return; }
       const csv = logsToCSV(logs);
       downloadBlob(`logs-${date}.csv`, new Blob([csv], {type:'text/csv'}));
       setStatus('Downloaded logs for ' + date);
     });
 
-    downloadRangeBtn.addEventListener('click', ()=>{
+    downloadRangeBtn.addEventListener('click', async ()=>{
       const from = exportFromInput.value; const to = exportToInput.value;
       if(!from || !to){ setStatus('Choose both from and to dates'); return; }
       const fromTs = new Date(from + 'T00:00:00').getTime();
       const toTs = new Date(to + 'T23:59:59').getTime();
-      const logs = loadLogs().filter(l => {
+      const logs = (await idbGetAll()).filter(l => {
         const t = new Date(l.t).getTime();
         return t >= fromTs && t <= toTs;
       });
@@ -562,7 +571,7 @@
     });
 
     saveAllBtn.addEventListener('click', async ()=>{
-      const logs = loadLogs();
+      const logs = await idbGetAll();
       if(!logs.length){ setStatus('No logs to save'); return; }
       const csv = logsToCSV(logs);
       if(window.showDirectoryPicker && chosenDirectoryHandle){
@@ -582,220 +591,22 @@
     // -------------------------
     // Init
     // -------------------------
-    renderLogs();
+    // migrate from localStorage if present (one-time)
+    (async function migrateLocal(){
+      try {
+        const raw = localStorage.getItem(LOG_KEY);
+        if(raw){
+          const arr = JSON.parse(raw);
+          for(const e of arr) await idbPut(e);
+          localStorage.removeItem(LOG_KEY);
+        }
+      } catch(e){ /* ignore */ }
+      await renderLogs();
+    })();
+
     console.log('Decoder libs:', { jsQR: !!window.jsQR, ZXing: !!window.ZXing });
     setDebug('Decoder libs: jsQR=' + (!!window.jsQR) + ' ZXing=' + (!!window.ZXing));
   })();
   </script>
 </body>
 </html>
-``````html
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Delivery QR Scanner</title>
-  <meta name="theme-color" content="#00377b">
-  <link rel="manifest" href="manifest.json">
-  <style>
-    body{font-family:Arial,Helvetica,sans-serif;margin:0;background:#f4f7fb;color:#111}
-    header{background:#00377b;color:#fff;padding:12px}
-    .wrap{max-width:1000px;margin:20px auto;padding:12px}
-    .card{background:#fff;padding:12px;border-radius:8px;margin-bottom:16px}
-    button{margin:4px;padding:8px 12px;border-radius:6px;border:0;cursor:pointer}
-    .danger{background:#dc2626;color:#fff}
-    .ghost{background:#eee}
-    .hidden{display:none}
-    table{width:100%;border-collapse:collapse;margin-top:10px}
-    th,td{border-bottom:1px solid #ddd;padding:6px;text-align:left}
-    #preview{display:none} /* preview canvas used only for capture */
-    #status{margin-top:8px;color:#333}
-    .small{font-size:0.9rem;color:#666}
-    .controls{display:flex;flex-wrap:wrap;gap:8px}
-    .field{display:inline-block;margin-right:8px}
-    input[type="date"]{padding:6px;border-radius:4px;border:1px solid #ccc}
-    /* camera square and finder overlay */
-    .camera-wrap { position: relative; width: 100%; max-width: 640px; margin: 0 auto; }
-    .camera-square { width: 100%; padding-top: 100%; position: relative; overflow: hidden; border-radius: 8px; background:#000; }
-    .camera-square video { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); width: auto; height: 100%; min-width: 100%; min-height: 100%; object-fit: cover; }
-    .finder {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      width: 70%;
-      height: 70%;
-      transform: translate(-50%,-50%);
-      box-sizing: border-box;
-      pointer-events: none;
-      border: 2px solid rgba(255,255,255,0.85);
-      border-radius: 6px;
-      box-shadow: 0 0 0 9999px rgba(0,0,0,0.25) inset;
-    }
-    .finder::before, .finder::after, .finder span::before, .finder span::after {
-      content: "";
-      position: absolute;
-      background: #00e676;
-      border-radius: 2px;
-    }
-    .finder::before { top: -2px; left: -2px; width: 28px; height: 4px; }
-    .finder::after  { bottom: -2px; right: -2px; width: 28px; height: 4px; }
-    .finder span::before { top: -2px; right: -2px; width: 4px; height: 28px; }
-    .finder span::after  { bottom: -2px; left: -2px; width: 4px; height: 28px; }
-    @media (max-width:520px){
-      .controls{flex-direction:column}
-      .field{width:100%}
-    }
-  </style>
-</head>
-<body>
-  <header><h1>Delivery QR Scanner</h1></header>
-
-  <div class="wrap">
-    <!-- Scanner card -->
-    <section class="card" id="scannerCard" aria-label="Scanner controls">
-      <h2>Scan QR</h2>
-
-      <div class="camera-wrap">
-        <div class="camera-square" id="cameraSquare">
-          <video id="video" playsinline autoplay muted aria-hidden="true" class="hidden"></video>
-          <div class="finder" aria-hidden="true"><span></span></div>
-        </div>
-      </div>
-
-      <canvas id="preview" class="hidden" aria-hidden="true"></canvas>
-
-      <div class="controls" role="group" aria-label="camera controls">
-        <button id="openNative" class="ghost" aria-label="Open native camera">Open Native Camera</button>
-        <button id="openInApp" aria-label="Open in-app camera">Open In-App Camera</button>
-        <button id="closeInApp" class="ghost hidden" aria-label="Close in-app camera">Close Camera</button>
-        <button id="capture" aria-label="Capture frame">Capture</button>
-        <button id="upload" class="ghost" aria-label="Upload photo">Upload Photo</button>
-      </div>
-
-      <input id="cameraInput" type="file" accept="image/*" capture="environment" class="hidden" aria-hidden="true">
-      <input id="file" type="file" accept="image/*" class="hidden" aria-hidden="true">
-
-      <div id="status" role="status">Ready — align QR inside the guide.</div>
-      <div id="debug" class="small" aria-hidden="true"></div>
-    </section>
-
-    <!-- Logs card -->
-    <section class="card" id="logsCard" aria-label="Stored logs">
-      <h2>Stored Logs <span id="count">0</span></h2>
-
-      <table id="logTable" aria-label="Logs table">
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Material</th>
-            <th>Truck</th>
-            <th>Tonnage</th>
-            <th>Driver</th>
-            <th>Phone</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-
-      <div style="margin-top:10px" class="controls">
-        <div class="field">
-          <label class="small">Single date</label><br>
-          <input id="exportDate" type="date" aria-label="Export single date">
-          <button id="downloadDate" class="ghost">Download Date</button>
-        </div>
-
-        <div class="field">
-          <label class="small">Range</label><br>
-          <input id="exportFrom" type="date" aria-label="Export from date">
-          <input id="exportTo" type="date" aria-label="Export to date">
-          <button id="downloadRange" class="ghost">Download Range</button>
-        </div>
-
-        <div class="field">
-          <button id="chooseFolder" class="ghost">Choose Save Folder</button>
-          <button id="saveAll" class="ghost">Save All</button>
-        </div>
-
-        <div class="field">
-          <button id="clearAll" class="danger">Clear All Logs</button>
-        </div>
-      </div>
-    </section>
-  </div>
-
-  <!-- Decoder libraries (must exist in libs/) -->
-  <script src="libs/jsqr.min.js"></script>
-  <script src="libs/zxing.min.js"></script>
-
-  <script>
-  (function(){
-    // -------------------------
-    // Config & elements
-    // -------------------------
-    const LOG_KEY = 'delivery_scanner_logs_v1';
-    const MAX_PIXELS = 2500000; // cap canvas pixel area (2.5MP)
-    const video = document.getElementById('video');
-    const preview = document.getElementById('preview');
-    const status = document.getElementById('status');
-    const debug = document.getElementById('debug');
-    const openInApp = document.getElementById('openInApp');
-    const closeInApp = document.getElementById('closeInApp');
-    const captureBtn = document.getElementById('capture');
-    const openNative = document.getElementById('openNative');
-    const cameraInput = document.getElementById('cameraInput');
-    const uploadBtn = document.getElementById('upload');
-    const fileInput = document.getElementById('file');
-    const logTableBody = document.querySelector('#logTable tbody');
-    const countSpan = document.getElementById('count');
-    const clearAllBtn = document.getElementById('clearAll');
-    const downloadDateBtn = document.getElementById('downloadDate');
-    const downloadRangeBtn = document.getElementById('downloadRange');
-    const exportDateInput = document.getElementById('exportDate');
-    const exportFromInput = document.getElementById('exportFrom');
-    const exportToInput = document.getElementById('exportTo');
-    const chooseFolderBtn = document.getElementById('chooseFolder');
-    const saveAllBtn = document.getElementById('saveAll');
-    const cameraSquare = document.getElementById('cameraSquare');
-
-    // Debug gating: show debug only if ?debug=1 in URL
-    const showDebug = location.search.includes('debug=1');
-    if(!showDebug) debug.style.display = 'none';
-
-    // Service worker registration
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('sw.js').then(r=>{
-        console.log('SW registered', r.scope);
-      }).catch(err=>{
-        console.warn('SW registration failed', err);
-      });
-    }
-
-    // -------------------------
-    // UI helpers
-    // -------------------------
-    function setStatus(txt){ status.textContent = txt; }
-    function setDebug(txt){ if(showDebug) debug.textContent = txt; console.log(txt); }
-
-    // -------------------------
-    // Storage & logs (with quota handling)
-    // -------------------------
-    function loadLogs(){ try { const raw = localStorage.getItem(LOG_KEY); return raw ? JSON.parse(raw) : []; } catch(e){ console.error('loadLogs error', e); return []; } }
-    function saveLogs(arr){
-      try {
-        localStorage.setItem(LOG_KEY, JSON.stringify(arr));
-      } catch(e) {
-        console.error('saveLogs failed', e);
-        alert('Saving logs failed: storage full or blocked.');
-      }
-    }
-    function uid(){ return Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
-
-    function addLogEntry(entry){
-      const logs = loadLogs();
-      logs.unshift(entry);
-      saveLogs(logs);
-      renderLogs();
-    }
-
