@@ -17,14 +17,39 @@
     .hidden{display:none}
     table{width:100%;border-collapse:collapse;margin-top:10px}
     th,td{border-bottom:1px solid #ddd;padding:6px;text-align:left}
-    #video{width:100%;max-width:640px;border-radius:6px;background:#000}
-    #preview{display:block;max-width:100%;margin-top:8px;border:1px solid #ddd}
+    #preview{display:none} /* preview canvas used only for capture */
     #status{margin-top:8px;color:#333}
     .small{font-size:0.9rem;color:#666}
     .controls{display:flex;flex-wrap:wrap;gap:8px}
     .field{display:inline-block;margin-right:8px}
     input[type="date"]{padding:6px;border-radius:4px;border:1px solid #ccc}
-    /* small responsive tweaks */
+    /* camera square and finder overlay */
+    .camera-wrap { position: relative; width: 100%; max-width: 640px; margin: 0 auto; }
+    .camera-square { width: 100%; padding-top: 100%; position: relative; overflow: hidden; border-radius: 8px; background:#000; }
+    .camera-square video { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); width: auto; height: 100%; min-width: 100%; min-height: 100%; object-fit: cover; }
+    .finder {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 70%;
+      height: 70%;
+      transform: translate(-50%,-50%);
+      box-sizing: border-box;
+      pointer-events: none;
+      border: 2px solid rgba(255,255,255,0.85);
+      border-radius: 6px;
+      box-shadow: 0 0 0 9999px rgba(0,0,0,0.25) inset;
+    }
+    .finder::before, .finder::after, .finder span::before, .finder span::after {
+      content: "";
+      position: absolute;
+      background: #00e676;
+      border-radius: 2px;
+    }
+    .finder::before { top: -2px; left: -2px; width: 28px; height: 4px; }
+    .finder::after  { bottom: -2px; right: -2px; width: 28px; height: 4px; }
+    .finder span::before { top: -2px; right: -2px; width: 4px; height: 28px; }
+    .finder span::after  { bottom: -2px; left: -2px; width: 4px; height: 28px; }
     @media (max-width:520px){
       .controls{flex-direction:column}
       .field{width:100%}
@@ -38,7 +63,14 @@
     <!-- Scanner card -->
     <section class="card" id="scannerCard" aria-label="Scanner controls">
       <h2>Scan QR</h2>
-      <video id="video" playsinline autoplay muted class="hidden" aria-hidden="true"></video>
+
+      <div class="camera-wrap">
+        <div class="camera-square" id="cameraSquare">
+          <video id="video" playsinline autoplay muted aria-hidden="true" class="hidden"></video>
+          <div class="finder" aria-hidden="true"><span></span></div>
+        </div>
+      </div>
+
       <canvas id="preview" class="hidden" aria-hidden="true"></canvas>
 
       <div class="controls" role="group" aria-label="camera controls">
@@ -133,6 +165,7 @@
     const exportToInput = document.getElementById('exportTo');
     const chooseFolderBtn = document.getElementById('chooseFolder');
     const saveAllBtn = document.getElementById('saveAll');
+    const cameraSquare = document.getElementById('cameraSquare');
 
     // Debug gating: show debug only if ?debug=1 in URL
     const showDebug = location.search.includes('debug=1');
@@ -203,7 +236,7 @@
     function parseDecoded(text){
       const s = (text||'').trim();
 
-      // Try JSON first (tolerant attempt optional)
+      // Try JSON first (strict)
       try {
         const obj = JSON.parse(s);
         const material = obj.materialType || obj.material || obj.material_name || obj.materials || '';
@@ -215,7 +248,7 @@
         const raw = s;
         return { time, material, truck, tonnage, raw, driverName, driverPhone, original: obj };
       } catch(e){
-        // Not strict JSON — fall back to heuristics
+        // Not JSON — fall back to heuristics
       }
 
       const parts = s.split(/[\n\r|;]+/).map(p=>p.trim()).filter(Boolean);
@@ -274,7 +307,7 @@
       }
     }
 
-    function cropCanvasCenter(srcCanvas, ratio=0.6){
+    function cropCanvasCenter(srcCanvas, ratio=0.7){
       const w = srcCanvas.width, h = srcCanvas.height;
       const cw = Math.max(100, Math.round(w * ratio)), ch = Math.max(100, Math.round(h * ratio));
       const sx = Math.round((w - cw)/2), sy = Math.round((h - ch)/2);
@@ -345,7 +378,7 @@
     }
 
     // -------------------------
-    // Camera helpers & capture (with caps and robust wait)
+    // Camera helpers & capture (square center-crop)
     // -------------------------
     function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
@@ -354,7 +387,6 @@
       while ((v.readyState < 2 || !v.videoWidth || !v.videoHeight) && (Date.now() - start) < timeout) {
         await sleep(120);
       }
-      // final small delay to stabilize on some devices
       await sleep(80);
     }
 
@@ -362,31 +394,34 @@
       if(!video || !video.srcObject){ setStatus('Camera not open'); return; }
       await waitForVideoReady(video);
 
-      // get video dims
+      // Determine square side (use the smaller of video width/height)
       const vw = video.videoWidth || 1280;
       const vh = video.videoHeight || 720;
-      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const side = Math.min(vw, vh);
 
-      // compute target canvas size and cap to MAX_PIXELS
-      let targetW = Math.round(vw * dpr);
-      let targetH = Math.round(vh * dpr);
-      if (targetW * targetH > MAX_PIXELS) {
-        const scale = Math.sqrt(MAX_PIXELS / (targetW * targetH));
-        targetW = Math.max(320, Math.round(targetW * scale));
-        targetH = Math.max(240, Math.round(targetH * scale));
+      // Source crop coordinates (center crop)
+      const sx = Math.round((vw - side) / 2);
+      const sy = Math.round((vh - side) / 2);
+      const sWidth = side;
+      const sHeight = side;
+
+      // Cap output pixels to avoid huge canvases
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      let targetSide = Math.round(side * dpr);
+      if (targetSide * targetSide > MAX_PIXELS) {
+        targetSide = Math.round(Math.sqrt(MAX_PIXELS));
       }
 
-      // set canvas pixel size and CSS size
-      preview.width = targetW;
-      preview.height = targetH;
-      preview.style.width = vw + 'px';
-      preview.style.height = vh + 'px';
+      // Set preview canvas to square pixel size
+      preview.width = targetSide;
+      preview.height = targetSide;
 
+      // Draw center-cropped square from video into canvas
       const ctx = preview.getContext('2d');
-      // draw scaled: map video to canvas pixel size
       ctx.setTransform(1,0,0,1,0,0);
       ctx.clearRect(0,0,preview.width,preview.height);
-      ctx.drawImage(video, 0, 0, preview.width, preview.height);
+      // drawImage(video, sx, sy, sWidth, sHeight, dx, dy, dWidth, dHeight)
+      ctx.drawImage(video, sx, sy, sWidth, sHeight, 0, 0, preview.width, preview.height);
 
       preview.classList.remove('hidden');
       setStatus('Captured — creating blob...');
@@ -404,14 +439,16 @@
       }
     });
 
-    // In-app camera open/close with higher resolution constraints
+    // In-app camera open/close with square visible area
     openInApp.addEventListener('click', async ()=>{
       try {
         const constraints = { video: { facingMode: { ideal:'environment' }, width:{ ideal:1280 }, height:{ ideal:720 } }, audio:false };
         const s = await navigator.mediaDevices.getUserMedia(constraints);
         video.srcObject = s;
         await waitForVideoReady(video);
+        // show video (CSS centers and crops it inside the square)
         video.classList.remove('hidden');
+        cameraSquare.classList.remove('hidden');
         closeInApp.classList.remove('hidden');
         openInApp.classList.add('hidden');
         setStatus('Camera open');
@@ -435,7 +472,6 @@
 
     // Native camera (mobile) and upload handlers
     openNative.addEventListener('click', ()=> {
-      // show a short message for mobile UX
       setStatus('Opening native camera — take a photo and confirm');
       cameraInput.click();
       setTimeout(()=> setStatus('Waiting for photo...'), 600);
@@ -449,7 +485,6 @@
         if(res) handleDecodedText(res.text, res.engine);
         else setStatus('No QR found');
       } catch(e){ setStatus('Decode error'); console.error(e); }
-      // clear input so same file can be selected again
       cameraInput.value = '';
     });
 
