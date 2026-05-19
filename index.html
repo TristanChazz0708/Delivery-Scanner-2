@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Delivery QR Scanner</title>
   <meta name="theme-color" content="#00377b">
-  <!-- Correct relative path to manifest -->
   <link rel="manifest" href="manifest.json">
   <style>
     body { font-family: Arial, sans-serif; margin:0; padding:0; background:#f4f7fb; }
@@ -66,16 +65,15 @@
     </section>
   </div>
 
-  <!-- Hidden input for native camera -->
+  <!-- Hidden inputs for native camera and upload -->
   <input id="cameraInput" type="file" accept="image/*" capture="environment" class="hidden">
 
-  <!-- Local decoder libraries (must exist in libs/) -->
-<script src="libs/jsqr.min.js"></script>
-<script src="libs/zxing.min.js"></script>
-
+  <!-- Decoder libraries -->
+  <script src="libs/jsqr.min.js"></script>
+  <script src="libs/zxing.min.js"></script>
 
   <script>
-  // Register service worker (must be named sw.js in repo root)
+  // Register service worker
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').then(r=>{
       console.log('SW registered', r.scope);
@@ -84,15 +82,61 @@
     });
   }
 
-  // Minimal scanner logic (replace with your full decode pipeline)
   const video = document.getElementById('video');
   const preview = document.getElementById('preview');
   const status = document.getElementById('status');
   const openInApp = document.getElementById('openInApp');
   const closeInApp = document.getElementById('closeInApp');
   const captureBtn = document.getElementById('capture');
+  const openNative = document.getElementById('openNative');
+  const cameraInput = document.getElementById('cameraInput');
+  const uploadBtn = document.getElementById('upload');
+  const fileInput = document.getElementById('file');
   let stream = null;
 
+  // Robust decode function
+  async function decodeFileRobust(fileOrBlob){
+    const img = await new Promise((res, rej)=>{
+      const i=new Image();
+      i.onload=()=>res(i);
+      i.onerror=()=>rej(new Error('image load'));
+      i.src = URL.createObjectURL(fileOrBlob);
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    canvas.getContext('2d').drawImage(img,0,0);
+    URL.revokeObjectURL(img.src);
+
+    const ctx = canvas.getContext('2d');
+    const data = ctx.getImageData(0,0,canvas.width,canvas.height);
+    const code = window.jsQR ? jsQR(data.data, data.width, data.height) : null;
+    if(code) return code.data;
+
+    if(window.ZXing && window.ZXing.BrowserQRCodeReader){
+      const reader = new window.ZXing.BrowserQRCodeReader();
+      const blob = await new Promise(res => canvas.toBlob(res, 'image/png'));
+      const url = URL.createObjectURL(blob);
+      try {
+        const result = await reader.decodeFromImageUrl(url);
+        URL.revokeObjectURL(url);
+        if(result && result.text) return result.text;
+      } catch(e) {
+        URL.revokeObjectURL(url);
+      }
+    }
+    throw new Error('No QR found');
+  }
+
+  function handleDecoded(text){
+    if(text){
+      status.textContent = 'Decoded: ' + text;
+      console.log('Decoded QR:', text);
+      // TODO: add to logs table
+    }
+  }
+
+  // In-app camera
   openInApp.addEventListener('click', async ()=>{
     try {
       stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'environment' } });
@@ -113,21 +157,54 @@
     closeInApp.classList.add('hidden');
     openInApp.classList.remove('hidden');
     status.textContent = 'Camera closed';
-    // clear preview
     const ctx = preview.getContext('2d');
     ctx && ctx.clearRect(0,0,preview.width,preview.height);
     preview.classList.add('hidden');
   });
 
-  captureBtn.addEventListener('click', ()=>{
+  captureBtn.addEventListener('click', async ()=>{
     if(stream && video.videoWidth){
       preview.width = video.videoWidth;
       preview.height = video.videoHeight;
       const ctx = preview.getContext('2d');
       ctx.drawImage(video,0,0,preview.width,preview.height);
       preview.classList.remove('hidden');
-      status.textContent = 'Captured frame — decode here';
-      // TODO: run jsQR or ZXing decode on preview canvas
+      status.textContent = 'Captured frame — decoding...';
+      try {
+        const blob = await new Promise(res => preview.toBlob(res, 'image/jpeg', 0.95));
+        const decoded = await decodeFileRobust(blob);
+        handleDecoded(decoded);
+      } catch(e) {
+        status.textContent = 'No QR found';
+      }
+    }
+  });
+
+  // Native camera (mobile)
+  openNative.addEventListener('click', ()=> cameraInput.click());
+  cameraInput.addEventListener('change', async ev=>{
+    const f = ev.target.files[0];
+    if(!f) return;
+    status.textContent = 'Decoding native photo...';
+    try {
+      const decoded = await decodeFileRobust(f);
+      handleDecoded(decoded);
+    } catch(e) {
+      status.textContent = 'No QR found';
+    }
+  });
+
+  // Upload photo (desktop)
+  uploadBtn.addEventListener('click', ()=> fileInput.click());
+  fileInput.addEventListener('change', async ev=>{
+    const f = ev.target.files[0];
+    if(!f) return;
+    status.textContent = 'Decoding uploaded photo...';
+    try {
+      const decoded = await decodeFileRobust(f);
+      handleDecoded(decoded);
+    } catch(e) {
+      status.textContent = 'No QR found';
     }
   });
   </script>
