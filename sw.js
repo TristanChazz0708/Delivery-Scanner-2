@@ -1,41 +1,51 @@
 // sw.js
-const CACHE_NAME = 'delivery-scanner-v1';
-const PRECACHE_URLS = [
-  '/', '/index.html', '/manifest.json',
-  '/libs/jsqr.min.js', '/libs/zxing.min.js',
-  '/assets/logo-192.png', '/assets/logo-512.png'
+const CACHE_NAME = "delivery-scanner-v2"; // bump version when you change files
+const FILES_TO_CACHE = [
+  "./",
+  "./index.html",
+  "./manifest.json",
+  "./libs/jsqr.min.js",
+  "./libs/zxing.min.js",
+  "./assets/logo-192.png",
+  "./assets/logo-512.png"
 ];
 
-self.addEventListener('install', event => {
-  self.skipWaiting();
+// Install: cache all required files
+self.addEventListener("install", event => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then(cache => cache.addAll(PRECACHE_URLS))
+    caches.open(CACHE_NAME).then(cache => {
+      return cache.addAll(FILES_TO_CACHE);
+    }).catch(err => {
+      console.error("SW install cache error", err);
+    })
   );
+  self.skipWaiting();
 });
 
-self.addEventListener('activate', event => {
+// Activate: clear old caches
+self.addEventListener("activate", event => {
   event.waitUntil(
-    caches.keys().then(keys => Promise.all(
-      keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))
-    ))
+    caches.keys().then(keys =>
+      Promise.all(
+        keys.map(k => {
+          if (k !== CACHE_NAME) {
+            return caches.delete(k);
+          }
+        })
+      )
+    )
   );
   self.clients.claim();
 });
 
-self.addEventListener('fetch', event => {
-  const req = event.request;
-  if (req.method !== 'GET') return;
+// Fetch: serve from cache, fall back to network
+self.addEventListener("fetch", event => {
   event.respondWith(
-    caches.match(req).then(cached => {
-      if (cached) return cached;
-      return fetch(req).then(networkRes => {
-        if (req.url.startsWith(self.location.origin)) {
-          caches.open(CACHE_NAME).then(cache => cache.put(req, networkRes.clone()));
-        }
-        return networkRes.clone();
-      }).catch(() => {
-        if (req.mode === 'navigate') return caches.match('/index.html');
-      });
+    caches.match(event.request).then(response => {
+      return response || fetch(event.request);
+    }).catch(err => {
+      console.warn("SW fetch error", err);
+      return fetch(event.request);
     })
   );
 });
