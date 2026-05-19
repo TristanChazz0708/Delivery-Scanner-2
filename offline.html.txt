@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Offline</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f4f7fb;color:#111}
+    .box{max-width:520px;padding:24px;background:#fff;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,0.08);text-align:center}
+    h1{margin:0 0 8px;font-size:20px;color:#00377b}
+    p{margin:8px 0 0;color:#444}
+    a{display:inline-block;margin-top:12px;padding:8px 12px;background:#00377b;color:#fff;border-radius:6px;text-decoration:none}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Offline</h1>
+    <p>You are offline. The app will work without internet after it has been opened once while online.</p>
+    <a href="./">Reload App</a>
+  </div>
+</body>
+</html>
